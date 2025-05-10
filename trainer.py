@@ -1,148 +1,148 @@
 import os
 import torch
-import torchaudio
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.optim as optim
-from torchaudio.transforms import MelSpectrogram, AmplitudeToDB
+import matplotlib.pyplot as plt
 from torch.utils.data import Dataset, DataLoader
+from audio_handler import AudioHandler  # Importamos solo el AudioHandler
 
 
-def split_audio(input_file, segment_duration=5, output_folder="segments"):
-    os.makedirs(output_folder, exist_ok=True)
-    waveform, sample_rate = torchaudio.load(input_file)
-    segment_samples = int(segment_duration * sample_rate)
-    total_segments = waveform.shape[1] // segment_samples
+# --- 1. Definición de la Red CNN ---
+class VoiceSimilarityCNN(nn.Module):
+    def __init__(self):
+        super().__init__()
+        # Bloque 1
+        self.conv1 = nn.Conv2d(1, 32, kernel_size=3, padding='same')
+        self.bn1 = nn.BatchNorm2d(32)
+        self.pool1 = nn.MaxPool2d(2)
+        self.drop1 = nn.Dropout(0.2)
+        
+        # Bloque 2
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding='same')
+        self.bn2 = nn.BatchNorm2d(64)
+        self.pool2 = nn.MaxPool2d(2)
+        self.drop2 = nn.Dropout(0.2)
+        
+        # Bloque 3
+        self.conv3 = nn.Conv2d(64, 128, kernel_size=3, padding='same')
+        self.bn3 = nn.BatchNorm2d(128)
+        self.pool3 = nn.MaxPool2d(2)
+        self.drop3 = nn.Dropout(0.2)
+        
+        # Capas densas (asume espectrogramas de 128x128 -> 16x16 después de 3 MaxPools)
+        self.flatten = nn.Flatten()
+        self.fc1 = nn.Linear(128 * 16 * 16, 256)
+        self.drop4 = nn.Dropout(0.3)
+        self.fc2 = nn.Linear(256, 1)
 
-    for i in range(total_segments):
-        segment = waveform[:, i * segment_samples : (i + 1) * segment_samples]
-        output_filename = os.path.join(output_folder, f"segment_{i:03d}.wav")
-        torchaudio.save(output_filename, segment, sample_rate)
+    def forward(self, x):
+        x = self.drop1(self.pool1(F.relu(self.bn1(self.conv1(x)))))
+        x = self.drop2(self.pool2(F.relu(self.bn2(self.conv2(x)))))
+        x = self.drop3(self.pool3(F.relu(self.bn3(self.conv3(x)))))
+        x = self.flatten(x)
+        x = self.drop4(F.relu(self.fc1(x)))
+        x = torch.sigmoid(self.fc2(x))
+        return x
 
-
-def pad_or_truncate(tensor, target_length=128):
-    current_length = tensor.shape[2]
-    if current_length < target_length:
-        tensor = F.pad(tensor, (0, target_length - current_length))
-    elif current_length > target_length:
-        tensor = tensor[:, :, :target_length]
-    return tensor
-
-class WavDataset(Dataset):
-    def __init__(self, reference_files, test_files, transform):
-        self.reference_files = reference_files
-        self.test_files = test_files
-        self.transform = transform
+# --- 2. Dataset y DataLoader ---
+class VoiceDataset(Dataset):
+    def __init__(self, voice_dir, negative_dir=None, audio_handler=None):
+        self.audio_handler = audio_handler or AudioHandler()
+        self.voice_files = [os.path.join(voice_dir, f) for f in os.listdir(voice_dir) if f.endswith('.wav')]
+        
+        # Usar 20% de los audios como negativos si no hay carpeta específica
+        self.negative_files = (
+            [os.path.join(negative_dir, f) for f in os.listdir(negative_dir) if f.endswith('.wav')]
+            if negative_dir
+            else self.voice_files[:len(self.voice_files) // 5]
+        )
+        
+        self.all_files = self.voice_files + self.negative_files
+        self.labels = [1] * len(self.voice_files) + [0] * len(self.negative_files)
 
     def __len__(self):
-        return min(len(self.reference_files), len(self.test_files))
+        return len(self.all_files)
 
     def __getitem__(self, idx):
-        ref_file = self.reference_files[idx % len(self.reference_files)]
-        test_file = self.test_files[idx % len(self.test_files)]
+        audio_path = self.all_files[idx]
+        spectrogram = self.audio_handler.process_audio_file(audio_path)
+        label = torch.tensor(self.labels[idx], dtype=torch.float32)
+        return spectrogram, label
 
-        waveform_ref, _ = torchaudio.load(ref_file)
-        waveform_test, _ = torchaudio.load(test_file)
+# --- 3. Entrenamiento + Gráficos ---
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-        if waveform_ref.shape[0] > 1:
-            waveform_ref = torch.mean(waveform_ref, dim=0, keepdim=True)
-        if waveform_test.shape[0] > 1:
-            waveform_test = torch.mean(waveform_test, dim=0, keepdim=True)
+def train_model():
+    # Configuración
+    batch_size = 32
+    epochs = 50
+    learning_rate = 0.001
+    
+    # Inicializar modelo, loss y optimizador
+    model = VoiceSimilarityCNN().to(device)
+    criterion = nn.BCELoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    
+    # Datos
+    dataset = VoiceDataset(
+        voice_dir="training_data",
+        negative_dir=None,  # Opcional: "negative_data" si tienes ejemplos negativos
+        audio_handler=AudioHandler()
+    )
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    
+    # Listas para métricas
+    train_loss = []
+    train_accuracy = []
 
-        spec_ref = self.transform(waveform_ref)
-        spec_test = self.transform(waveform_test)
-
-        spec_ref = pad_or_truncate(spec_ref, target_length=128)
-        spec_test = pad_or_truncate(spec_test, target_length=128)
-
-        return spec_ref, spec_test
-
-# -------------------- DEFINICIÓN DE LA RED --------------------
-class VoiceSimilarityNet(nn.Module):
-    def __init__(self):
-        super(VoiceSimilarityNet, self).__init__()
+    for epoch in range(epochs):
+        epoch_loss = 0.0
+        correct = 0
+        total = 0
         
-        self.conv1 = nn.Sequential(
-            nn.Conv2d(1, 16, kernel_size=3, padding=1),
-            nn.BatchNorm2d(16),
-            nn.ReLU(),
-            nn.MaxPool2d(2)
-        )
-        self.conv2 = nn.Sequential(
-            nn.Conv2d(16, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32),
-            nn.ReLU(),
-            nn.MaxPool2d(2)
-        )
-        self.conv3 = nn.Sequential(
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(),
-            nn.MaxPool2d(2)
-        )
-
-        self.fc1 = nn.Linear(64 * 16 * 16, 256)
-        self.fc2 = nn.Linear(256, 128)
-        self.fc3 = nn.Linear(128, 1)  # Última capa 
-
-    def forward(self, ref, test):
-        ref = self.conv1(ref)
-        ref = self.conv2(ref)
-        ref = self.conv3(ref)
-        ref = ref.view(ref.size(0), -1)
-        ref = F.relu(self.fc1(ref))
-        ref = F.relu(self.fc2(ref))
-
-        test = self.conv1(test)
-        test = self.conv2(test)
-        test = self.conv3(test)
-        test = test.view(test.size(0), -1)
-        test = F.relu(self.fc1(test))
-        test = F.relu(self.fc2(test))
-
-        similarity = F.cosine_similarity(ref, test)  
-        similarity = torch.sigmoid(self.fc3(similarity.unsqueeze(1)))  
-        return similarity
-
-mel_transform = torch.nn.Sequential(
-    MelSpectrogram(sample_rate=16000, n_fft=400, hop_length=160, n_mels=128),
-    AmplitudeToDB()
-)
-
-reference_voice_dir = "segments_ref"
-test_voice_dir = "segments_test"
-
-reference_files = [os.path.join(reference_voice_dir, f) for f in os.listdir(reference_voice_dir) if f.endswith('.wav')]
-test_files = [os.path.join(test_voice_dir, f) for f in os.listdir(test_voice_dir) if f.endswith('.wav')]
-
-dataset = WavDataset(reference_files, test_files, mel_transform)
-dataloader = DataLoader(dataset, batch_size=8, shuffle=True)
-
-model = VoiceSimilarityNet()
-optimizer = optim.Adam(model.parameters(), lr=0.001)
-loss_fn = nn.BCELoss()  # Binary Cross Entropy
-
-num_epochs = 5
-for epoch in range(num_epochs):
-    model.train()
-    epoch_loss = 0.0
-    for ref_spec, test_spec in dataloader:
-        similarity = model(ref_spec, test_spec)
-        target = torch.ones_like(similarity)  
+        for spectrograms, labels in dataloader:
+            spectrograms, labels = spectrograms.to(device), labels.to(device)
+            
+            optimizer.zero_grad()
+            outputs = model(spectrograms)
+            loss = criterion(outputs.squeeze(), labels)
+            loss.backward()
+            optimizer.step()
+            
+            # Calcular accuracy
+            predicted = (outputs.squeeze() > 0.5).float()
+            correct += (predicted == labels).sum().item()
+            total += labels.size(0)
+            epoch_loss += loss.item()
         
-        loss = loss_fn(similarity, target)
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        # Guardar métricas
+        epoch_loss /= len(dataloader)
+        epoch_accuracy = correct / total
+        train_loss.append(epoch_loss)
+        train_accuracy.append(epoch_accuracy)
         
-        epoch_loss += loss.item()
+        print(f"Época {epoch + 1}/{epochs} | Loss: {epoch_loss:.4f} | Accuracy: {epoch_accuracy:.2%}")
+    
+    # Guardar modelo
+    torch.save(model.state_dict(), "voice_similarity_model.pth")
+    
+    # Graficar
+    plt.figure(figsize=(12, 4))
+    plt.subplot(1, 2, 1)
+    plt.plot(train_loss, 'r-', label='Loss')
+    plt.xlabel('Época')
+    plt.title('Pérdida durante el entrenamiento')
+    plt.legend()
+    
+    plt.subplot(1, 2, 2)
+    plt.plot(train_accuracy, 'b-', label='Accuracy')
+    plt.xlabel('Época')
+    plt.title('Accuracy durante el entrenamiento')
+    plt.legend()
+    
+    plt.tight_layout()
+    plt.savefig('training_metrics.png')
+    plt.show()
 
-    print(f"Epoch [{epoch+1}/{num_epochs}] - Loss: {epoch_loss / len(dataloader):.4f}")
-
-
-model.eval()
-with torch.no_grad():
-    for i in range(len(test_files)):
-        ref_spec, test_spec = dataset[i]
-        similarity = model(ref_spec.unsqueeze(0), test_spec.unsqueeze(0))
-        print(f"Similitud entre '{reference_files[i % len(reference_files)]}' y '{test_files[i]}': {similarity.item():.2f}")
+if __name__ == "__main__":
+    train_model()
