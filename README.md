@@ -1,5 +1,6 @@
 # Voice Comparator
 
+
 Este proyecto fue elaborado para sentar las bases de redes neuronales.
 Fue elaborado por @didi-121 y @RichGN28
 
